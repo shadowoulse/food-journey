@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recipe Finder</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+
+        .search-section {
+            margin-bottom: 30px;
+        }
+
+        .search-box {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+
+        button {
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        button:hover {
+            background: #5a6fd8;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+
+        .recipes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .recipe-card {
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: transform 0.2s;
+        }
+
+        .recipe-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .recipe-image {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+        }
+
+        .recipe-content {
+            padding: 15px;
+        }
+
+        .recipe-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        .recipe-info {
+            display: flex;
+            justify-content: space-between;
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .recipe-summary {
+            color: #555;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+
+        .error {
+            background: #ffe6e6;
+            color: #d00;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🍳 Recipe Finder</h1>
+        
+        <div class="search-section">
+            <div class="search-box">
+                <input type="text" id="ingredientsInput" placeholder="Enter ingredients (e.g., chicken, tomato, cheese)">
+                <button onclick="searchRecipes()">Search Recipes</button>
+            </div>
+        </div>
+
+        <div id="loading" class="loading" style="display: none;">
+            Searching for delicious recipes...
+        </div>
+
+        <div id="error" class="error" style="display: none;"></div>
+
+        <div id="recipesContainer" class="recipes-grid"></div>
+    </div>
+
+    <script>
+        const API_KEY = 'YOUR_SPOONACULAR_API_KEY_HERE';
+        const BASE_URL = 'https://api.spoonacular.com/recipes';
+
+        async function searchRecipes() {
+            const ingredients = document.getElementById('ingredientsInput').value.trim();
+            
+            if (!ingredients) {
+                showError('Please enter some ingredients');
+                return;
+            }
+
+            showLoading(true);
+            hideError();
+            
+            try {
+                const response = await fetch(
+                    `${BASE_URL}/findByIngredients?ingredients=${encodeURIComponent(ingredients)}&number=12&apiKey=${API_KEY}`
+                );
+                
+                if (!response.ok) {
+                    throw new Error(`API Error: ${response.status}`);
+                }
+                
+                const recipes = await response.json();
+                
+                if (recipes.length === 0) {
+                    showError('No recipes found with those ingredients. Try different ingredients!');
+                    return;
+                }
+
+                // Get detailed info for each recipe
+                const detailedRecipes = await Promise.all(
+                    recipes.slice(0, 8).map(recipe => getRecipeDetails(recipe.id))
+                );
+                
+                displayRecipes(detailedRecipes);
+                
+            } catch (error) {
+                console.error('Error:', error);
+                showError('Failed to fetch recipes. Please try again.');
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        async function getRecipeDetails(recipeId) {
+            try {
+                const response = await fetch(
+                    `${BASE_URL}/${recipeId}/information?apiKey=${API_KEY}`
+                );
+                return await response.json();
+            } catch (error) {
+                console.error('Error fetching recipe details:', error);
+                return null;
+            }
+        }
+
+        function displayRecipes(recipes) {
+            const container = document.getElementById('recipesContainer');
+            
+            container.innerHTML = recipes
+                .filter(recipe => recipe !== null)
+                .map(recipe => `
+                    <div class="recipe-card">
+                        <img src="${recipe.image}" alt="${recipe.title}" class="recipe-image">
+                        <div class="recipe-content">
+                            <div class="recipe-title">${recipe.title}</div>
+                            <div class="recipe-info">
+                                <span>⏱️ ${recipe.readyInMinutes || 'N/A'} min</span>
+                                <span>👥 ${recipe.servings || 'N/A'} servings</span>
+                            </div>
+                            <div class="recipe-summary">
+                                ${recipe.summary ? recipe.summary.replace(/<[^>]*>/g, '').substring(0, 120) + '...' : 'No description available'}
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+        }
+
+        function showLoading(show) {
+            document.getElementById('loading').style.display = show ? 'block' : 'none';
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+
+        function hideError() {
+            document.getElementById('error').style.display = 'none';
+        }
+
+        // Allow Enter key to trigger search
+        document.getElementById('ingredientsInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                searchRecipes();
+            }
+        });
+    </script>
+</body>
+</html>

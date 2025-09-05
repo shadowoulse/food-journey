@@ -1,0 +1,949 @@
+﻿import requests
+from bs4 import BeautifulSoup
+import re
+import csv
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, quote_plus, urlparse
+import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import json
+import logging
+from typing import Set, List, Dict, Optional
+
+class ImprovedMarylandGalleryScraper:
+    def __init__(self, max_workers=10, delay_between_requests=1.0):
+        self.max_workers = max_workers
+        self.delay = delay_between_requests
+        self.session = self._create_session()
+        self.email_pattern = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+        self.phone_pattern = re.compile(r'(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})')
+        self.lock = threading.Lock()
+        self.csv_file = "maryland_galleries_comprehensive.csv"
+        self.found_galleries = set()
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        # Maryland cities and areas to search
+        self.md_locations = [
+            "Baltimore Maryland", "Annapolis Maryland", "Frederick Maryland", 
+            "Rockville Maryland", "Bethesda Maryland", "Silver Spring Maryland",
+            "College Park Maryland", "Takoma Park Maryland", "Hagerstown Maryland",
+            "Salisbury Maryland", "Cumberland Maryland", "Ocean City Maryland",
+            "Easton Maryland", "Westminster Maryland", "Bowie Maryland",
+            "Gaithersburg Maryland", "Germantown Maryland", "Ellicott City Maryland",
+            "Chevy Chase Maryland", "Towson Maryland", "Columbia Maryland"
+        ]
+        
+        # Improved search terms
+        self.search_terms = [
+            "art gallery {location}",
+            "contemporary art {location}", 
+            "fine art gallery {location}",
+            "art space {location}",
+            "artist studio {location}",
+            "art exhibition {location}",
+            "photography gallery {location}",
+            "sculpture gallery {location}",
+            "local art {location}",
+            "art center {location}",
+            "artist collective {location}",
+            "gallery opening {location}"
+        ]
+        
+        # Known Maryland gallery websites (seed list)
+        self.known_galleries = [
+            "https://www.creativealliancebaltimore.org/",
+            "https://www.americanvisionartmuseum.org/",
+            "https://www.bmoremuseum.org/",
+            "https://www.thewalters.org/",
+            "https://www.gallerybfoto.com/",
+            # Add more known galleries here
+        ]
+    
+    def _create_session(self):
+        """Create a robust session with retry strategy"""
+        session = requests.Session()
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            respect_retry_after_header=True
+        )
+        
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=20,
+            max_retries=retry_strategy
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Better user agent rotation
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        ]
+        session.headers.update({'User-Agent': user_agents[0]})
+        
+        return session
+    
+    def search_google_alternative(self, query: str, max_results: int = 10) -> Set[str]:
+        """Search using a more reliable method - SerpApi alternative or custom Google search"""
+        urls = set()
+        
+        try:
+            # Using DuckDuckGo as it's more scraping-friendly
+            search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+            }
+            
+            response = self.session.get(search_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Find all result links
+            results = soup.find_all('a', class_='result__a')
+            
+            for result in results[:max_results]:
+                href = result.get('href')
+                if href and href.startswith('http'):
+                    urls.add(href)
+                    
+        except Exception as e:
+            self.logger.error(f"Search error for query '{query}': {e}")
+        
+        return urls
+    
+    def find_galleries_from_arts_organizations(self) -> List[str]:
+        """Find galleries through Maryland arts organizations"""
+        org_urls = [
+            "https://www.msac.org/",  # Maryland State Arts Council
+            "https://www.artbma.org/",  # Art galleries in Baltimore
+            "https://www.creativealliance.org/",
+            "https://www.annapolisarts.org/",
+            "https://www.frederickartists.org/"
+        ]
+        
+        gallery_urls = set()
+        
+        for org_url in org_urls:
+            try:
+                response = self.session.get(org_url, timeout=10)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Look for links that might lead to galleries
+                links = soup.find_all('a', href=True)
+                
+                for link in links:
+                    href = link.get('href')
+                    if href:
+                        # Convert relative URLs to absolute
+                        full_url = urljoin(org_url, href)
+                        
+                        # Check if this looks like a gallery URL
+                        if self._is_gallery_url(full_url):
+                            gallery_urls.add(full_url)
+                
+                time.sleep(self.delay)
+                
+            except Exception as e:
+                self.logger.error(f"Error scraping {org_url}: {e}")
+        
+        return list(gallery_urls)
+    
+    def _is_gallery_url(self, url: str) -> bool:
+        """Enhanced URL filtering for galleries"""
+        if not url or not url.startswith('http'):
+            return False
+            
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        path = parsed.path.lower()
+        full_url = (domain + path).lower()
+        
+        # Skip social media and unwanted domains
+        skip_domains = [
+            'facebook.com', 'instagram.com', 'twitter.com', 'pinterest.com',
+            'linkedin.com', 'yelp.com', 'google.com', 'wikipedia.org',
+            'tripadvisor.com', 'eventbrite.com', 'patch.com', 'foursquare.com',
+            'youtube.com', 'amazon.com', 'ebay.com'
+        ]
+        
+        if any(skip in domain for skip in skip_domains):
+            return False
+        
+        # Look for gallery-related keywords
+        gallery_keywords = [
+            'gallery', 'art', 'artist', 'studio', 'exhibition', 'museum',
+            'contemporary', 'fine', 'creative', 'space', 'collective',
+            'atelier', 'visual', 'culture', 'arts'
+        ]
+        
+        return any(keyword in full_url for keyword in gallery_keywords)
+    
+    def extract_enhanced_contact_info(self, url: str) -> Dict:
+        """Enhanced contact information extraction"""
+        result = {
+            'url': url,
+            'name': '',
+            'emails': set(),
+            'phone': '',
+            'address': '',
+            'city': '',
+            'state': '',
+            'zip_code': '',
+            'instagram': '',
+            'facebook': '',
+            'twitter': '',
+            'website_description': '',
+            'hours': '',
+            'established': ''
+        }
+        
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Extract gallery name with multiple strategies
+            result['name'] = self._extract_gallery_name(soup, url)
+            
+            # Extract emails with better filtering
+            result['emails'] = self._extract_emails(response.text)
+            
+            # Extract phone numbers
+            result['phone'] = self._extract_phone(response.text)
+            
+            # Extract address information
+            address_info = self._extract_address(response.text)
+            result.update(address_info)
+            
+            # Extract social media
+            result['instagram'] = self._extract_instagram(soup)
+            result['facebook'] = self._extract_facebook(soup)
+            result['twitter'] = self._extract_twitter(soup)
+            
+            # Extract business hours
+            result['hours'] = self._extract_hours(soup)
+            
+            # Extract description
+            result['website_description'] = self._extract_description(soup)
+            
+            time.sleep(self.delay)  # Be respectful with delays
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting info from {url}: {e}")
+        
+        return result
+    
+    def _extract_gallery_name(self, soup: BeautifulSoup, url: str) -> str:
+        """Extract gallery name using multiple strategies"""
+        # Strategy 1: Title tag
+        if soup.title:
+            title_text = soup.title.get_text().strip()
+            # Clean common title patterns
+            for pattern in [' | ', ' - ', ' – ', ' :: ', ' | Gallery', ' Gallery']:
+                if pattern in title_text:
+                    title_text = title_text.split(pattern)[0]
+            if 3 <= len(title_text) <= 100:
+                return title_text
+        
+        # Strategy 2: h1 tags
+        h1_tags = soup.find_all('h1')
+        for tag in h1_tags:
+            text = tag.get_text().strip()
+            if 3 <= len(text) <= 100:
+                return text
+        
+        # Strategy 3: Logo alt text
+        logo_imgs = soup.find_all('img', alt=True)
+        for img in logo_imgs:
+            alt_text = img.get('alt').strip()
+            if any(word in alt_text.lower() for word in ['gallery', 'art', 'logo']) and len(alt_text) <= 100:
+                return alt_text
+        
+        # Strategy 4: From URL
+        domain = urlparse(url).netloc
+        name = domain.replace('www.', '').replace('.com', '').replace('.org', '').replace('.net', '')
+        return name.replace('-', ' ').replace('_', ' ').title()
+    
+    def _extract_emails(self, text: str) -> Set[str]:
+        """Extract and filter email addresses"""
+        emails = self.email_pattern.findall(text)
+        good_emails = set()
+        
+        skip_patterns = [
+            'example.com', 'sentry.io', 'noreply', 'no-reply',
+            'facebook.com', 'instagram.com', 'google.com', 'mailchimp.com',
+            'wordpress.com', 'wixpress.com', 'squarespace.com'
+        ]
+        
+        good_patterns = [
+            'info@', 'contact@', 'gallery@', 'hello@', 'curator@',
+            'director@', 'admin@', 'art@', 'sales@'
+        ]
+        
+        for email in emails:
+            email_lower = email.lower()
+            
+            # Skip obviously bad emails
+            if any(skip in email_lower for skip in skip_patterns):
+                continue
+            
+            # Prioritize good email patterns
+            if any(good in email_lower for good in good_patterns):
+                good_emails.add(email)
+            elif '@gmail.com' in email_lower or '@yahoo.com' in email_lower:
+                good_emails.add(email)
+            elif len(email) > 5 and '@' in email and '.' in email.split('@')[1]:
+                good_emails.add(email)
+        
+        return good_emails
+    
+    def _extract_phone(self, text: str) -> str:
+        """Extract phone number"""
+        phones = self.phone_pattern.findall(text)
+        if phones:
+            # Clean up the phone number
+            phone = re.sub(r'[^\d]', '', phones[0])
+            if len(phone) == 10:
+                return f"({phone[:3]}) {phone[3:6]}-{phone[6:]}"
+            elif len(phone) == 11 and phone[0] == '1':
+                return f"({phone[1:4]}) {phone[4:7]}-{phone[7:]}"
+        return ""
+    
+    def _extract_address(self, text: str) -> Dict:
+        """Extract address components"""
+        result = {'address': '', 'city': '', 'state': '', 'zip_code': ''}
+        
+        # Maryland-specific address patterns
+        md_pattern = re.compile(
+            r'(\d+\s+[A-Za-z0-9\s,.-]+?)(?:,\s*)?'
+            r'(Baltimore|Annapolis|Frederick|Rockville|Bethesda|Silver Spring|'
+            r'College Park|Takoma Park|Hagerstown|Salisbury|Cumberland|'
+            r'Ocean City|Easton|Westminster|Bowie|Gaithersburg|Germantown|'
+            r'Ellicott City|Chevy Chase|Towson|Columbia)'
+            r'(?:,\s*)?(MD|Maryland)(?:\s+(\d{5}(?:-\d{4})?))?',
+            re.IGNORECASE
+        )
+        
+        match = md_pattern.search(text)
+        if match:
+            result['address'] = match.group(1).strip()
+            result['city'] = match.group(2)
+            result['state'] = 'MD'
+            if match.group(4):
+                result['zip_code'] = match.group(4)
+        
+        return result
+    
+    def _extract_instagram(self, soup: BeautifulSoup) -> str:
+        """Extract Instagram URL"""
+        instagram_links = soup.find_all('a', href=re.compile(r'instagram\.com/[^/]+/?$'))
+        return instagram_links[0]['href'] if instagram_links else ""
+    
+    def _extract_facebook(self, soup: BeautifulSoup) -> str:
+        """Extract Facebook URL"""
+        facebook_links = soup.find_all('a', href=re.compile(r'facebook\.com/[^/]+/?$'))
+        return facebook_links[0]['href'] if facebook_links else ""
+    
+    def _extract_twitter(self, soup: BeautifulSoup) -> str:
+        """Extract Twitter URL"""
+        twitter_links = soup.find_all('a', href=re.compile(r'twitter\.com/[^/]+/?$'))
+        return twitter_links[0]['href'] if twitter_links else ""
+    
+    def _extract_hours(self, soup: BeautifulSoup) -> str:
+        """Extract business hours"""
+        hours_patterns = [
+            re.compile(r'hours?[:]\s*([^<\n]+)', re.IGNORECASE),
+            re.compile(r'open[:]\s*([^<\n]+)', re.IGNORECASE),
+            re.compile(r'(mon|tue|wed|thu|fri|sat|sun)[^<\n]*\d+[^<\n]*', re.IGNORECASE)
+        ]
+        
+        text = soup.get_text()
+        for pattern in hours_patterns:
+            match = pattern.search(text)
+            if match:
+                return match.group(1).strip()[:200]  # Limit length
+        return ""
+    
+    def _extract_description(self, soup: BeautifulSoup) -> str:
+        """Extract gallery description"""
+        # Try meta description first
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            return meta_desc['content'][:300]
+        
+        # Try about section
+        about_sections = soup.find_all(['p', 'div'], text=re.compile(r'about', re.IGNORECASE))
+        for section in about_sections:
+            text = section.get_text().strip()
+            if 20 <= len(text) <= 300:
+                return text
+        
+        return ""
+    
+    def save_enhanced_csv(self, results: List[Dict]):
+        """Save enhanced results to CSV"""
+        print(f"\nSaving to {self.csv_file}...")
+        
+        with open(self.csv_file, mode="w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                "Gallery Name", "Website", "Email", "Phone", "Address", 
+                "City", "State", "Zip Code", "Instagram", "Facebook", 
+                "Twitter", "Hours", "Description"
+            ])
+            
+            for result in results:
+                gallery_name = result.get('name', 'Unknown Gallery')
+                
+                if result.get('emails'):
+                    for email in result['emails']:
+                        writer.writerow([
+                            gallery_name,
+                            result.get('url', ''),
+                            email,
+                            result.get('phone', ''),
+                            result.get('address', ''),
+                            result.get('city', ''),
+                            result.get('state', ''),
+                            result.get('zip_code', ''),
+                            result.get('instagram', ''),
+                            result.get('facebook', ''),
+                            result.get('twitter', ''),
+                            result.get('hours', ''),
+                            result.get('website_description', '')
+                        ])
+                else:
+                    # Include galleries without emails but with other contact info
+                    if any([result.get('phone'), result.get('instagram'), result.get('facebook')]):
+                        writer.writerow([
+                            gallery_name,
+                            result.get('url', ''),
+                            '',
+                            result.get('phone', ''),
+                            result.get('address', ''),
+                            result.get('city', ''),
+                            result.get('state', ''),
+                            result.get('zip_code', ''),
+                            result.get('instagram', ''),
+                            result.get('facebook', ''),
+                            result.get('twitter', ''),
+                            result.get('hours', ''),
+                            result.get('website_description', '')
+                        ])
+    
+    def run(self):
+        """Main improved scraping method"""
+        start_time = time.time()
+        
+        try:
+            print("IMPROVED Maryland Gallery Scraper v2.0\n")
+            print("Searching comprehensively for Maryland art galleries...\n")
+            
+            all_gallery_urls = set()
+            
+            # Step 1: Start with known galleries
+            all_gallery_urls.update(self.known_galleries)
+            print(f"Added {len(self.known_galleries)} known galleries")
+            
+            # Step 2: Search through arts organizations
+            org_galleries = self.find_galleries_from_arts_organizations()
+            all_gallery_urls.update(org_galleries)
+            print(f"Found {len(org_galleries)} galleries through arts organizations")
+            
+            # Step 3: Web search for galleries (limited to avoid overwhelming)
+            for location in self.md_locations[:8]:  # Limit locations
+                for search_term in self.search_terms[:6]:  # Limit search terms
+                    query = search_term.format(location=location)
+                    urls = self.search_google_alternative(query, max_results=5)
+                    
+                    # Filter for gallery URLs
+                    gallery_urls = [url for url in urls if self._is_gallery_url(url)]
+                    all_gallery_urls.update(gallery_urls)
+                    
+                    time.sleep(self.delay)
+                    
+                    if len(all_gallery_urls) > 100:  # Reasonable limit
+                        break
+                
+                if len(all_gallery_urls) > 100:
+                    break
+            
+            all_gallery_urls = list(all_gallery_urls)
+            print(f"\nTotal gallery websites to process: {len(all_gallery_urls)}")
+            
+            if not all_gallery_urls:
+                print("No gallery URLs found. Please check your internet connection or try again later.")
+                return
+            
+            # Step 4: Extract enhanced contact info
+            results = []
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_url = {
+                    executor.submit(self.extract_enhanced_contact_info, url): url 
+                    for url in all_gallery_urls
+                }
+                
+                for future in as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        
+                        with self.lock:
+                            name = result['name'][:40] + "..." if len(result['name']) > 40 else result['name']
+                            if result['emails']:
+                                print(f"✓ {name} - {len(result['emails'])} emails")
+                            else:
+                                print(f"○ {name} - No emails")
+                                
+                    except Exception as e:
+                        self.logger.error(f"Error processing {url}: {e}")
+            
+            # Step 5: Filter and save results
+            good_results = [
+                result for result in results 
+                if result.get('emails') or result.get('phone') or 
+                   result.get('instagram') or result.get('facebook')
+            ]
+            
+            self.save_enhanced_csv(good_results)
+            
+            # Summary
+            total_emails = sum(len(r.get('emails', [])) for r in good_results)
+            galleries_with_emails = sum(1 for r in good_results if r.get('emails'))
+            galleries_with_phones = sum(1 for r in good_results if r.get('phone'))
+            galleries_with_social = sum(1 for r in good_results if r.get('instagram') or r.get('facebook'))
+            galleries_with_addresses = sum(1 for r in good_results if r.get('address'))
+            
+            elapsed_time = time.time() - start_time
+            
+            print(f"\n{'='*50}")
+            print(f"MARYLAND GALLERY SCRAPER RESULTS")
+            print(f"{'='*50}")
+            print(f"Total processing time: {elapsed_time:.2f} seconds")
+            print(f"Galleries processed: {len(results)}")
+            print(f"Galleries with contact info: {len(good_results)}")
+            print(f"Galleries with emails: {galleries_with_emails}")
+            print(f"Galleries with phone numbers: {galleries_with_phones}")
+            print(f"Galleries with social media: {galleries_with_social}")
+            print(f"Galleries with addresses: {galleries_with_addresses}")
+            print(f"Total emails found: {total_emails}")
+            print(f"Results saved to: {self.csv_file}")
+            print(f"{'='*50}")
+            
+        finally:
+            self.session.close()
+
+
+# Usage example
+if __name__ == "__main__":
+    # Use fewer workers and longer delays to be more respectful
+    scraper = ImprovedMarylandGalleryScraper(max_workers=5, delay_between_requests=1.5)
+    scraper.run()
+
+abouve is the original working code 
+ here below is a new untestesd one made in venice etc
+import requests
+from bs4 import BeautifulSoup
+import re
+import csv
+import time
+import random
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, quote_plus, urlparse
+import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import logging
+from typing import Set, List, Dict, Optional
+
+class ImprovedMarylandGalleryScraper:
+    def __init__(self, max_workers=5, delay_between_requests=2.0, proxies=None):
+        self.max_workers = max_workers
+        self.delay = delay_between_requests
+        self.proxies = proxies
+
+        # Define user_agents before calling _create_session
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0'
+        ]
+
+        self.session = self._create_session()
+        self.email_pattern = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+        self.phone_pattern = re.compile(r'($?\d{3}$?[-.\s]?\d{3}[-.\s]?\d{4})')
+        self.lock = threading.Lock()
+        self.csv_file = "maryland_galleries_comprehensive_v3.csv"
+
+        # Setup logging
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
+
+        # Maryland cities and areas to search (reduced for efficiency)
+        self.md_locations = [
+            "Baltimore Maryland", "Annapolis Maryland", "Frederick Maryland",
+            "Rockville Maryland", "Bethesda Maryland"
+        ]
+
+        # Focused search terms
+        self.search_terms = [
+            "art gallery {location}",
+            "contemporary art {location}",
+            "fine art gallery {location}"
+        ]
+
+        # Known Maryland gallery websites (seed list)
+        self.known_galleries = [
+            "https://www.creativealliancebaltimore.org/",
+            "https://www.americanvisionartmuseum.org/",
+            "https://www.bmoremuseum.org/",
+            "https://www.thewalters.org/",
+            "https://www.gallerybfoto.com/"
+        ]
+
+    def _create_session(self):
+        """Create a robust session with retry strategy, user-agent rotation, and proxy support"""
+        session = requests.Session()
+
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504, 403],
+            respect_retry_after_header=True
+        )
+
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=retry_strategy
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        session.headers.update({'User-Agent': random.choice(self.user_agents)})
+
+        if self.proxies:
+            session.proxies.update(self.proxies)
+
+        return session
+
+    def is_url_valid(self, url: str) -> bool:
+        """Check if a URL is valid and well-formed"""
+        try:
+            result = urlparse(url)
+            return all([result.scheme, result.netloc])
+        except:
+            return False
+
+    def search_google_alternative(self, query: str, max_results: int = 3) -> Set[str]:
+        """Search using DuckDuckGo (with caution) or replace with SerpAPI/Google Custom Search"""
+        urls = set()
+
+        try:
+            search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+            headers = {
+                'User-Agent': random.choice(self.user_agents),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive',
+            }
+
+            response = self.session.get(search_url, headers=headers, timeout=15)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            results = soup.find_all('a', class_='result__a')
+
+            for result in results[:max_results]:
+                href = result.get('href')
+                if href and href.startswith('http') and self.is_url_valid(href):
+                    urls.add(href)
+
+            time.sleep(random.uniform(2, 5))  # Respectful delay
+
+        except Exception as e:
+            self.logger.error(f"Search error for query '{query}': {e}")
+
+        return urls
+
+    def find_galleries_from_arts_organizations(self) -> List[str]:
+        """Find galleries through Maryland arts organizations and directories"""
+        org_urls = [
+            "https://www.msac.org/directory",
+            "https://www.artbma.org/galleries",
+            "https://www.creativealliance.org/galleries"
+        ]
+
+        gallery_urls = set()
+
+        for org_url in org_urls:
+            try:
+                response = self.session.get(org_url, timeout=10)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                links = soup.find_all('a', href=True)
+
+                for link in links:
+                    href = link.get('href')
+                    if href:
+                        full_url = urljoin(org_url, href)
+                        if self._is_gallery_url(full_url):
+                            gallery_urls.add(full_url)
+
+                time.sleep(self.delay)
+
+            except Exception as e:
+                self.logger.error(f"Error scraping {org_url}: {e}")
+
+        return list(gallery_urls)
+
+    def _is_gallery_url(self, url: str) -> bool:
+        """Filter URLs to only include likely gallery pages"""
+        if not url or not url.startswith('http'):
+            return False
+
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        path = parsed.path.lower()
+
+        skip_domains = [
+            'facebook.com', 'instagram.com', 'twitter.com', 'pinterest.com',
+            'linkedin.com', 'yelp.com', 'google.com', 'wikipedia.org',
+            'tripadvisor.com', 'eventbrite.com', 'patch.com', 'foursquare.com',
+            'youtube.com', 'amazon.com', 'ebay.com'
+        ]
+
+        if any(skip in domain for skip in skip_domains):
+            return False
+
+        gallery_keywords = [
+            'gallery', 'art', 'artist', 'studio', 'exhibition', 'museum',
+            'contemporary', 'fine', 'creative', 'space', 'collective',
+            'atelier', 'visual', 'culture', 'arts'
+        ]
+
+        return any(keyword in domain + path for keyword in gallery_keywords)
+
+    def extract_enhanced_contact_info(self, url: str) -> Dict:
+        """Extract contact info, focusing on high-value pages like 'Contact Us'"""
+        result = {
+            'url': url,
+            'name': '',
+            'emails': set(),
+            'phone': '',
+            'address': '',
+            'city': '',
+            'state': '',
+            'zip_code': '',
+            'instagram': '',
+            'facebook': '',
+            'twitter': '',
+            'website_description': '',
+            'hours': ''
+        }
+
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Rotate user agent
+            self.session.headers.update({'User-Agent': random.choice(self.user_agents)})
+
+            # Extract gallery name
+            result['name'] = self._extract_gallery_name(soup, url)
+
+            # Look for contact links
+            contact_links = soup.find_all('a', href=True, string=re.compile(r'contact|about|visit', re.IGNORECASE))
+            if contact_links:
+                for link in contact_links[:2]:  # Limit to 2 contact pages
+                    contact_url = urljoin(url, link['href'])
+                    try:
+                        contact_response = self.session.get(contact_url, timeout=10)
+                        contact_soup = BeautifulSoup(contact_response.text, 'html.parser')
+                        result['emails'].update(self._extract_emails(contact_soup.get_text()))
+                        result['phone'] = self._extract_phone(contact_soup.get_text())
+                        address_info = self._extract_address(contact_soup.get_text())
+                        result.update(address_info)
+                        result['instagram'] = self._extract_instagram(contact_soup)
+                        result['facebook'] = self._extract_facebook(contact_soup)
+                        result['twitter'] = self._extract_twitter(contact_soup)
+                        result['hours'] = self._extract_hours(contact_soup)
+                        result['website_description'] = self._extract_description(contact_soup)
+                    except Exception as e:
+                        self.logger.error(f"Error scraping contact page {contact_url}: {e}")
+            else:
+                # Fallback to main page
+                result['emails'].update(self._extract_emails(response.text))
+                result['phone'] = self._extract_phone(response.text)
+                address_info = self._extract_address(response.text)
+                result.update(address_info)
+                result['instagram'] = self._extract_instagram(soup)
+                result['facebook'] = self._extract_facebook(soup)
+                result['twitter'] = self._extract_twitter(soup)
+                result['hours'] = self._extract_hours(soup)
+                result['website_description'] = self._extract_description(soup)
+
+            time.sleep(self.delay)
+
+        except Exception as e:
+            self.logger.error(f"Error extracting info from {url}: {e}")
+
+        return result
+
+    def _extract_gallery_name(self, soup: BeautifulSoup, url: str) -> str:
+        """Extract gallery name using multiple strategies"""
+        if soup.title:
+            title_text = soup.title.get_text().strip()
+            for pattern in [' | ', ' - ', ' – ', ' :: ']:
+                if pattern in title_text:
+                    title_text = title_text.split(pattern)[0]
+            if 3 <= len(title_text) <= 100:
+                return title_text
+
+        h1_tags = soup.find_all('h1')
+        for tag in h1_tags:
+            text = tag.get_text().strip()
+            if 3 <= len(text) <= 100:
+                return text
+
+        domain = urlparse(url).netloc
+        name = domain.replace('www.', '').replace('.com', '').replace('.org', '').replace('.net', '')
+        return name.replace('-', ' ').replace('_', ' ').title()
+
+    def _extract_emails(self, text: str) -> Set[str]:
+        """Extract and filter email addresses"""
+        emails = self.email_pattern.findall(text)
+        good_emails = set()
+        gallery_domain = urlparse(url).netloc if url else ''
+
+        skip_patterns = [
+            'example.com', 'sentry.io', 'noreply', 'no-reply',
+            'facebook.com', 'instagram.com', 'google.com', 'mailchimp.com',
+            'wordpress.com', 'wixpress.com', 'squarespace.com'
+        ]
+
+        for email in emails:
+            email_lower = email.lower()
+            if any(skip in email_lower for skip in skip_patterns):
+                continue
+            if '@gmail.com' in email_lower or '@yahoo.com' in email_lower:
+                continue
+            if '@' in email and '.' in email.split('@')[-1]:
+                good_emails.add(email)
+
+        return good_emails
+
+    def _extract_phone(self, text: str) -> str:
+        """Extract and format phone number"""
+        phones = self.phone_pattern.findall(text)
+        if phones:
+            phone = re.sub(r'[^\d]', '', phones[0])
+            if len(phone) == 10:
+                return f"({phone[:3]}) {phone[3:6]}-{phone[6:]}"
+            elif len(phone) == 11 and phone[0] == '1':
+                return f"({phone[1:4]}) {phone[4:7]}-{phone[7:]}"
+        return ""
+
+    def _extract_address(self, text: str) -> Dict:
+        """Extract address components, focusing on Maryland"""
+        result = {'address': '', 'city': '', 'state': '', 'zip_code': ''}
+
+        md_cities = [
+            'Baltimore', 'Annapolis', 'Frederick', 'Rockville', 'Bethesda',
+            'Silver Spring', 'College Park', 'Takoma Park', 'Hagerstown',
+            'Salisbury', 'Cumberland', 'Ocean City', 'Easton', 'Westminster',
+            'Bowie', 'Gaithersburg', 'Germantown', 'Ellicott City',
+            'Chevy Chase', 'Towson', 'Columbia'
+        ]
+
+        md_pattern = re.compile(
+            rf'(\d+\s+[A-Za-z0-9\s,.-]+?)(?:,\s*)?(?:{"|".join(md_cities)})'
+            rf'(?:,\s*)?(MD|Maryland)(?:\s+(\d{5}(?:-\d{4})?))?',
+            re.IGNORECASE
+        )
+
+        match = md_pattern.search(text)
+        if match:
+            result['address'] = match.group(1).strip()
+            result['city'] = match.group(2)
+            result['state'] = 'MD'
+            if len(match.groups()) > 2 and match.group(3):
+                result['zip_code'] = match.group(3)
+
+        return result
+
+    def _extract_instagram(self, soup: BeautifulSoup) -> str:
+        """Extract Instagram URL from meta tags, scripts, or links"""
+        meta_instagram = soup.find('meta', attrs={'property': 'instagram:profile_url'})
+        if meta_instagram and meta_instagram.get('content'):
+            return meta_instagram['content']
+
+        scripts = soup.find_all('script', type='application/ld+json')
+        for script in scripts:
+            try:
+                data = json.loads(script.string)
+                if data.get('sameAs'):
+                    for url in data['sameAs']:
+                        if 'instagram.com' in url:
+                            return url
+            except:
+                pass
+
+        instagram_links = soup.find_all('a', href=re.compile(r'instagram\.com/[^/]+/?$'))
+        return instagram_links[0]['href'] if instagram_links else ""
+
+    def _extract_facebook(self, soup: BeautifulSoup) -> str:
+        """Extract Facebook URL"""
+        facebook_links = soup.find_all('a', href=re.compile(r'facebook\.com/[^/]+/?$'))
+        return facebook_links[0]['href'] if facebook_links else ""
+
+    def _extract_twitter(self, soup: BeautifulSoup) -> str:
+        """Extract Twitter URL"""
+        twitter_links = soup.find_all('a', href=re.compile(r'twitter\.com/[^/]+/?$'))
+        return twitter_links[0]['href'] if twitter_links else ""
+
+    def _extract_hours(self, soup: BeautifulSoup) -> str:
+        """Extract business hours"""
+        hours_patterns = [
+            re.compile(r'hours?[:]\s*([^<\n]+)', re.IGNORECASE),
+            re.compile(r'open[:]\s*([^<\n]+)', re.IGNORECASE),
+            re.compile(r'(mon|tue|wed|thu|fri|sat|sun)[^<\n]*\d+[^<\n]*', re.IGNORECASE)
+        ]
+
+        text = soup.get_text()
+        for pattern in hours_patterns:
+            match = pattern.search(text)
+            if match:
+                return match.group(1).strip()[:200]
+        return ""
+
+    def _extract_description(self, soup: BeautifulSoup) -> str:
+        """Extract gallery description from meta or about sections"""
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            return meta_desc['content'][:300]
+
+        about_sections = soup.find_all(['p', 'div'], string=re.compile(r'about', re.IGNORECASE))
+        for section in about_sections:
+            text = section
