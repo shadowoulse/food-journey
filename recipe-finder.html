@@ -213,7 +213,7 @@
             container.innerHTML = recipes
                 .filter(recipe => recipe !== null)
                 .map(recipe => `
-                    <div class="recipe-card">
+                    <div class="recipe-card" onclick="window.open('${recipe.sourceUrl || recipe.spoonacularSourceUrl}', '_blank')" style="cursor: pointer;">
                         <img src="${recipe.image}" alt="${recipe.title}" class="recipe-image">
                         <div class="recipe-content">
                             <div class="recipe-title">${recipe.title}</div>
@@ -224,6 +224,7 @@
                             <div class="recipe-summary">
                                 ${recipe.summary ? recipe.summary.replace(/<[^>]*>/g, '').substring(0, 120) + '...' : 'No description available'}
                             </div>
+                            <div style="margin-top: 10px; color: #667eea; font-size: 12px;">Click to view full recipe →</div>
                         </div>
                     </div>
                 `).join('');
